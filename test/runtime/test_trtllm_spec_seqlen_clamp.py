@@ -138,7 +138,7 @@ def test_cuda_graph_capture_builder_clamps():
     be.init_cuda_graph_state(max_bs, seq_lens_buf)
 
     bs = 4
-    be._init_multi_token_metadata_capture(bs, SPEC_NUM_TOKENS, seq_lens_buf)
+    be._init_multi_token_metadata_capture(bs, SPEC_NUM_TOKENS)
     cache_seqlens = be.forward_prefill_metadata.cache_seqlens_int32
 
     assert int(cache_seqlens.min()) >= SPEC_NUM_TOKENS
