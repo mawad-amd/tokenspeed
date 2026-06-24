@@ -135,6 +135,12 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         self.cache_seqlens_buf = torch.zeros(
             (max_bs,), dtype=torch.int32, device=config.device
         )
+        # KV seqlens clamped to >= spec_num_tokens for the MTP verify path.
+        # Padded decode rows have seq_len=1 (InputBuffer); with q_len=spec_num_tokens
+        # they'd hit an empty causal span and the kernel returns NaN. Mirrors mha.py.
+        self.spec_cache_seqlens_buf = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=config.device
+        )
         self.cu_seqlens_q_buf = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device=config.device
         )
@@ -402,6 +408,16 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             ),
         )
 
+    def _clamped_spec_seqlens(self, seq_lens: torch.Tensor, bs: int) -> torch.Tensor:
+        """Return KV seqlens clamped to >= spec_num_tokens for the MTP verify path.
+
+        Writes into the persistent spec_cache_seqlens_buf (CUDA-graph safe)
+        to avoid NaN from empty causal spans on padded rows (seq_len=1).
+        """
+        dst = self.spec_cache_seqlens_buf[:bs]
+        torch.clamp_min(seq_lens[:bs], self.spec_num_tokens, out=dst)
+        return dst
+
     def _init_multi_token_metadata(
         self,
         bs: int,
@@ -418,7 +434,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         ), f"seq_lens must be int32, got {seq_lens.dtype}"
         device = seq_lens.device
         self.forward_prefill_metadata = TRTLLMMHAMetadata(
-            cache_seqlens_int32=seq_lens[:bs],
+            cache_seqlens_int32=self._clamped_spec_seqlens(seq_lens, bs),
             max_seq_len_q=spec_num_tokens,
             max_seq_len_k=self.max_context_len,
             cu_seqlens_q=torch.arange(
@@ -547,9 +563,16 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
     def _init_multi_token_metadata_capture(
         self, bs: int, spec_num_tokens: int, seq_lens: torch.Tensor
     ):
-        # cache_seqlens aliases seq_lens_buf; routes through the decode kernel.
+        # Multi-token decode: seed spec_cache_seqlens_buf (clamped to >=
+        # spec_num_tokens) at capture so padded rows (seq_len=1) avoid NaN.
+        # The replay path refreshes it each step.
+        torch.clamp_min(
+            self.cuda_graph_cache_seqlens[:bs],
+            spec_num_tokens,
+            out=self.spec_cache_seqlens_buf[:bs],
+        )
         metadata = TRTLLMMHAMetadata(
-            cache_seqlens_int32=self.cuda_graph_cache_seqlens[:bs],
+            cache_seqlens_int32=self.spec_cache_seqlens_buf[:bs],
             max_seq_len_q=spec_num_tokens,
             max_seq_len_k=self.max_context_len,
             cu_seqlens_q=torch.arange(
@@ -589,6 +612,16 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 max_num_pages=self.max_num_pages,
                 page_size=self.page_size,
                 dummy_slot=0,
+            )
+
+        # Refresh spec_cache_seqlens_buf (clamped to >= spec_num_tokens) from
+        # this step's seq_lens so padded rows (seq_len=1) avoid NaN in the
+        # multi-token (target-verify) decode path.
+        if self.spec_num_tokens > 1 and not self.is_draft:
+            torch.clamp_min(
+                seq_lens[:bs],
+                self.spec_num_tokens,
+                out=self.spec_cache_seqlens_buf[:bs],
             )
 
         if bs in self.cuda_graph_prefill_metadata:
