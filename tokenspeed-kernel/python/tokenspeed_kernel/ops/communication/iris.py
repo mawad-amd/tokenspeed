@@ -728,3 +728,74 @@ def iris_allreduce_residual_rmsnorm(
         norm_out=norm_out,
         residual_out=residual_out,
     )
+
+
+# ---------------------------------------------------------------------------
+# Graph-capture-safe custom_op wrappers (v10h pattern)
+#
+# These wrappers use torch.library.custom_op with mutates_args to ensure
+# stable output buffer addresses across CUDA graph capture and replay.
+# Without these, the .clone() in the eager path creates new tensor addresses
+# on every call, breaking graph replay.
+#
+# Usage: call create_iris_state() during eager warmup, then use
+# iris_all_reduce_graph_safe() inside graph-captured regions.
+# ---------------------------------------------------------------------------
+
+_IRIS_AR_REGISTRY: dict = {}
+
+
+@torch.library.custom_op(
+    "tokenspeed::iris_all_reduce", mutates_args=("output",)
+)
+def iris_all_reduce_graph_safe(
+    inp: torch.Tensor,
+    output: torch.Tensor,
+    comm_id: int,
+) -> None:
+    """Graph-capture-safe iris AllReduce.
+
+    Copies inp to symmetric heap, runs iris allreduce, writes result to output.
+    The output tensor must be pre-allocated with stable address (from _buf_cache).
+    """
+    state = _IRIS_AR_REGISTRY[comm_id]
+    result = state.all_reduce(inp, safe=False)
+    output.copy_(result)
+
+
+@iris_all_reduce_graph_safe.register_fake
+def _iris_all_reduce_fake(
+    inp: torch.Tensor,
+    output: torch.Tensor,
+    comm_id: int,
+) -> None:
+    pass
+
+
+def register_iris_for_graph_capture(
+    comm_id: int,
+    state: "IrisAllReduce",
+) -> None:
+    """Register an IrisAllReduce state for use with graph-safe custom_op."""
+    _IRIS_AR_REGISTRY[comm_id] = state
+
+
+# ---------------------------------------------------------------------------
+# Gloo PG for iris init (v10h fix)
+#
+# iris.iris() calls dist.barrier() and dist.all_gather() during symmetric
+# heap initialization. If the default PG uses NCCL (as in vLLM), these
+# collectives corrupt the TP PG's NCCL transport state (27x regression).
+#
+# Fix: create a dedicated gloo PG for iris init collectives.
+# ---------------------------------------------------------------------------
+
+_iris_gloo_pg = None
+
+
+def get_iris_gloo_pg() -> dist.ProcessGroup:
+    """Get or create a dedicated gloo PG for iris init collectives."""
+    global _iris_gloo_pg
+    if _iris_gloo_pg is None:
+        _iris_gloo_pg = dist.new_group(backend="gloo")
+    return _iris_gloo_pg
