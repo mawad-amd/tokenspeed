@@ -86,9 +86,47 @@ _iris_ctx_singleton = None
 
 
 def _get_or_create_iris_context(heap_size: int):
+    """Create iris context with gloo PG override to prevent NCCL deadlocks.
+
+    iris.iris() calls dist.barrier() and distributed_allgather() for DMA-BUF
+    handle exchange. When the NCCL backend is busy (e.g., during vLLM model
+    loading), these calls deadlock. We monkey-patch them to use a dedicated
+    gloo process group during init, then restore the originals.
+    """
     global _iris_ctx_singleton
-    if _iris_ctx_singleton is None:
+    if _iris_ctx_singleton is not None:
+        return _iris_ctx_singleton
+
+    import numpy as np
+    import iris.host.memory.symmetric_heap as sh_mod
+    import iris.host.distributed.helpers as helpers_mod
+
+    gloo_pg = get_iris_gloo_pg()
+
+    orig_barrier = dist.barrier
+    orig_allgather = helpers_mod.distributed_allgather
+
+    def _gloo_barrier(*args, **kwargs):
+        orig_barrier(group=gloo_pg)
+
+    def _gloo_allgather(local_arr, *args, **kwargs):
+        world_size = dist.get_world_size()
+        local_tensor = torch.tensor(local_arr, dtype=torch.int64, device="cpu")
+        gathered = [torch.zeros_like(local_tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, local_tensor, group=gloo_pg)
+        return np.concatenate([t.numpy() for t in gathered])
+
+    dist.barrier = _gloo_barrier
+    helpers_mod.distributed_allgather = _gloo_allgather
+    sh_mod.distributed_allgather = _gloo_allgather
+
+    try:
         _iris_ctx_singleton = iris.iris(heap_size=heap_size)
+    finally:
+        dist.barrier = orig_barrier
+        helpers_mod.distributed_allgather = orig_allgather
+        sh_mod.distributed_allgather = orig_allgather
+
     return _iris_ctx_singleton
 
 
@@ -346,6 +384,14 @@ class IrisAllReduce(object):
         )
 
         self.world_size = group.size()
+
+        # Warmup: run one small allreduce to pre-initialize workspace
+        # (_heap_bases_slice) so graph capture doesn't hit
+        # "workspace must be warmed up" error.
+        _warmup_inp = self._ctx.zeros(16, dtype=dtype)
+        _warmup_out = self._ctx.zeros(16, dtype=dtype)
+        _iris_all_reduce(_warmup_out, _warmup_inp, self._ctx)
+        logger.debug("Iris allreduce workspace warmed up")
 
     def all_reduce(
         self,
