@@ -781,6 +781,75 @@ def register_iris_for_graph_capture(
 
 
 # ---------------------------------------------------------------------------
+# Graph-capture-safe IrisRSAG custom_ops
+# ---------------------------------------------------------------------------
+
+_IRIS_RSAG_REGISTRY: dict = {}
+
+
+@torch.library.custom_op(
+    "tokenspeed::iris_reduce_scatter", mutates_args=("output",)
+)
+def iris_reduce_scatter_graph_safe(
+    inp: torch.Tensor,
+    output: torch.Tensor,
+    comm_id: int,
+    local_num_tokens: int,
+) -> None:
+    """Graph-capture-safe iris ReduceScatter."""
+    rsag = _IRIS_RSAG_REGISTRY[comm_id]
+    world_size = rsag.world_size
+    token_list = [local_num_tokens] * world_size
+    result = rsag.reduce_scatter(inp, token_list_in_group=token_list, safe=False)
+    output.copy_(result)
+
+
+@iris_reduce_scatter_graph_safe.register_fake
+def _iris_rs_fake(
+    inp: torch.Tensor,
+    output: torch.Tensor,
+    comm_id: int,
+    local_num_tokens: int,
+) -> None:
+    pass
+
+
+@torch.library.custom_op(
+    "tokenspeed::iris_all_gather", mutates_args=("output",)
+)
+def iris_all_gather_graph_safe(
+    inp: torch.Tensor,
+    output: torch.Tensor,
+    comm_id: int,
+    local_num_tokens: int,
+) -> None:
+    """Graph-capture-safe iris AllGather."""
+    rsag = _IRIS_RSAG_REGISTRY[comm_id]
+    world_size = rsag.world_size
+    token_list = [local_num_tokens] * world_size
+    result = rsag.all_gather(inp, token_list_in_group=token_list, safe=False)
+    output.copy_(result)
+
+
+@iris_all_gather_graph_safe.register_fake
+def _iris_ag_fake(
+    inp: torch.Tensor,
+    output: torch.Tensor,
+    comm_id: int,
+    local_num_tokens: int,
+) -> None:
+    pass
+
+
+def register_iris_rsag_for_graph_capture(
+    comm_id: int,
+    state: "IrisRSAG",
+) -> None:
+    """Register an IrisRSAG state for use with graph-safe custom_ops."""
+    _IRIS_RSAG_REGISTRY[comm_id] = state
+
+
+# ---------------------------------------------------------------------------
 # Gloo PG for iris init (v10h fix)
 #
 # iris.iris() calls dist.barrier() and dist.all_gather() during symmetric
