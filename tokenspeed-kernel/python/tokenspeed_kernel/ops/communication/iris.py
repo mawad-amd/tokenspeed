@@ -20,9 +20,11 @@
 
 import importlib
 import logging
+import os
 import pkgutil
 from typing import List, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton, tl, triton
@@ -83,12 +85,51 @@ def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
 
 
 _iris_ctx_singleton = None
+_gloo_pg = None
 
 
 def _get_or_create_iris_context(heap_size: int):
-    global _iris_ctx_singleton
-    if _iris_ctx_singleton is None:
+    """Create iris context with gloo PG override to prevent NCCL deadlocks.
+
+    iris.iris() internally calls dist.barrier() and distributed_allgather()
+    for DMA-BUF handle exchange. When the NCCL backend is busy (e.g., during
+    vLLM model loading), these calls can deadlock. We temporarily override
+    them to use a dedicated gloo process group.
+    """
+    global _iris_ctx_singleton, _gloo_pg
+    if _iris_ctx_singleton is not None:
+        return _iris_ctx_singleton
+
+    import iris.host.memory.symmetric_heap as sh_mod
+    import iris.host.distributed.helpers as helpers_mod
+
+    if _gloo_pg is None:
+        _gloo_pg = dist.new_group(backend="gloo")
+
+    orig_barrier = dist.barrier
+    orig_allgather = helpers_mod.distributed_allgather
+
+    def gloo_barrier(*args, **kwargs):
+        orig_barrier(group=_gloo_pg)
+
+    def gloo_allgather(local_arr, *args, **kwargs):
+        world_size = dist.get_world_size()
+        local_tensor = torch.tensor(local_arr, dtype=torch.int64, device="cpu")
+        gathered = [torch.zeros_like(local_tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, local_tensor, group=_gloo_pg)
+        return np.concatenate([t.numpy() for t in gathered])
+
+    dist.barrier = gloo_barrier
+    helpers_mod.distributed_allgather = gloo_allgather
+    sh_mod.distributed_allgather = gloo_allgather
+
+    try:
         _iris_ctx_singleton = iris.iris(heap_size=heap_size)
+    finally:
+        dist.barrier = orig_barrier
+        helpers_mod.distributed_allgather = orig_allgather
+        sh_mod.distributed_allgather = orig_allgather
+
     return _iris_ctx_singleton
 
 
