@@ -83,7 +83,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
-    break_attn,
+    break_point,
     is_breakable_capture_active,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -3550,6 +3550,7 @@ class DeepseekV4Attention(nn.Module):
         out, _ = self.wo_b(z.flatten(1))
         return out
 
+    @break_point(out="hidden_states")
     def forward(
         self,
         positions: torch.Tensor,
@@ -3563,37 +3564,10 @@ class DeepseekV4Attention(nn.Module):
         # does multiple paged-cache writes (SWA / compressor / indexer), a
         # data/length-dependent indexer -> top-k stage, the FlashMLA sparse kernel,
         # AND aux-stream forks -- none of which can be captured into a CUDA graph.
-        # So under a prefill-graph capture the whole attention runs eager (output is
-        # token-shaped [tokens, hidden_size] = hidden_states.shape) while the layer's
-        # norms + MoE stay graphed. No-op (direct call) when not capturing. Padding
-        # rows are handled by the existing metadata.is_valid_token masking. See
-        # docs/design/prefill-breakable-cudagraph.md.
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        return break_attn(
-            self._forward_breakable_impl,
-            hidden_states.shape,
-            hidden_states.dtype,
-            hidden_states.device,
-            positions,
-            hidden_states,
-            ctx,
-            out_cache_loc,
-            swa_slot_mapping,
-            compressor_slot_cache,
-        )
-
-    def _forward_breakable_impl(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-        swa_slot_mapping: torch.Tensor | None = None,
-        compressor_slot_cache: dict | None = None,
-    ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            return hidden_states
+        # So under a prefill-graph capture the whole attention runs eager (reading
+        # the live ``ctx``) while the layer's norms + MoE stay graphed; direct call
+        # otherwise (see ``break_point``). Padding rows are handled by the existing
+        # metadata.is_valid_token masking. See docs/design/prefill-breakable-cudagraph.md.
         if compressor_slot_cache is None:
             compressor_slot_cache = {}
         profile_prefix = f"attn_{self.attention_kind}"
@@ -4086,12 +4060,6 @@ class DeepseekV4Model(nn.Module):
 
 class DeepseekV4ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV4Model
-
-    # DSA attention's eager break selects its prefill/decode/mixed backend path
-    # from the CAPTURED ctx.forward_mode (baked EXTEND at capture), so a mixed
-    # batch would mis-route to the prefill path. Pure-extend is correct (validated);
-    # mixed stays eager until the break reads the live mode from the singleton.
-    prefill_graph_supports_mixed = False
 
     def get_stacked_params_mapping(self):
         return [

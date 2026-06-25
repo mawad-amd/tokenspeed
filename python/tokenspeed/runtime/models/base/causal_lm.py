@@ -44,18 +44,6 @@ class BaseCausalLM(nn.Module):
 
     model_cls: type[BaseTransformerModel]
 
-    # Breakable prefill CUDA graph capability flags (read by
-    # ModelExecutor._install_prefill_graph_runner). Conservative defaults: the
-    # graph is allowed but mixed (prefill+decode) batches are NOT graphed unless a
-    # subclass opts in. A model opts into mixed only if its attention break reads
-    # the LIVE prefill/decode split from the singleton backend
-    # (``attn_backend.prefill_graph_token_split``) rather than the captured ctx --
-    # otherwise a mixed batch replays with the stale capture-time forward mode/
-    # split and silently mis-routes rows. See deepseek_v3 (opts in) vs deepseek_v4/
-    # glm5 (do not).
-    prefill_graph_enabled: bool = True
-    prefill_graph_supports_mixed: bool = False
-
     def __init__(
         self,
         config: PretrainedConfig,

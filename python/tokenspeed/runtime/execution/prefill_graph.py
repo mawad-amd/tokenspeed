@@ -45,7 +45,10 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    BreakableCapture,
+    active_forward,
+)
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_prefill_token_buckets
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -69,10 +72,6 @@ class PrefillGraphRunner:
         model_is_mrope: Whether positions use the 3-row mrope buffer.
         pool: Optional CUDA mempool id to share with the decode graph.
         enabled: Master switch (e.g. disabled under ``enforce_eager``).
-        supports_mixed: Whether mixed (prefill+decode) batches may use the graph.
-            Only models whose attention break reads the live prefill/decode split
-            from the singleton backend (MLA) are correct on mixed; others restrict
-            the graph to pure-extend batches.
     """
 
     def __init__(
@@ -84,13 +83,11 @@ class PrefillGraphRunner:
         model_is_mrope: bool,
         pool=None,
         enabled: bool = True,
-        supports_mixed: bool = False,
         num_warmup: int = 3,
     ) -> None:
         self.inner_model = inner_model
         self.input_buffers = input_buffers
         self.model_is_mrope = model_is_mrope
-        self.supports_mixed = supports_mixed
         self.num_warmup = num_warmup
         self.world_size = config.world_size
         self.dp_size = config.data_parallel_size
@@ -118,8 +115,11 @@ class PrefillGraphRunner:
             return
         for bucket in sorted(self._buckets, reverse=True):
             self._ctx = make_dummy_batch(bucket)
+            # Publish the dummy context as ambient so breaks record it as their
+            # capture-time context (rebound to the live one at replay).
             try:
-                self._capture_bucket(bucket)
+                with active_forward(self._ctx):
+                    self._capture_bucket(bucket)
             finally:
                 self._ctx = None
         sample = next(iter(self._captures.values()), None)
@@ -172,39 +172,27 @@ class PrefillGraphRunner:
 
         # Replay over `bucket` (padded) tokens; attention metadata stays at the
         # real `n` (set upstream), so the eager attention break only touches real
-        # tokens and the padded rows produce discarded garbage. Under DP also pin
-        # global_num_tokens/global_bs to the captured uniform layout so any live
-        # read during the break matches the baked EP shapes.
-        # Publish the LIVE prefill/decode token split on the (singleton) attn backend
-        # so the eager attention break can recover it at replay: the break closes
-        # over the dummy ``ctx`` captured at startup, so its ``ctx.bs`` /
-        # ``ctx.num_extends`` are stale -- but ``ctx.attn_backend`` is the live
-        # singleton. Models that split prefill vs decode inside attention (MLA) read
-        # this; others ignore it. ``n`` is the real total token count (pre-padding).
-        spec = getattr(ctx.attn_backend, "spec_num_tokens", 1) or 1
-        num_decode_tokens = max(ctx.bs - ctx.num_extends, 0) * spec
-        num_prefill_tokens = n - num_decode_tokens
-        self._ctx = ctx
+        # tokens and the padded rows produce discarded garbage. Pin input_num_tokens
+        # to the bucket and, under DP, global_num_tokens/global_bs to the captured
+        # uniform layout so any live read during the break matches the baked EP
+        # shapes. The break reads forward_mode / bs / num_extends LIVE off this same
+        # (ambient) ctx -- which we do NOT pin -- so models split prefill vs decode
+        # and dispatch the per-mode backend correctly with no side channel.
         saved = ctx.input_num_tokens
         saved_global_num_tokens = ctx.global_num_tokens
         saved_global_bs = ctx.global_bs
-        ctx.attn_backend.prefill_graph_token_split = (
-            num_prefill_tokens,
-            num_decode_tokens,
-        )
         ctx.input_num_tokens = bucket
         if dp:
             ctx.global_num_tokens = [bucket] * self.world_size
             ctx.global_bs = [1] * self.world_size
         try:
-            self._captures[bucket].replay()
+            with active_forward(ctx):
+                self._captures[bucket].replay()
             hidden_states, aux_hidden_states = self._outputs[bucket]
         finally:
             ctx.input_num_tokens = saved
             ctx.global_num_tokens = saved_global_num_tokens
             ctx.global_bs = saved_global_bs
-            ctx.attn_backend.prefill_graph_token_split = None
-            self._ctx = None
 
         hidden_states = hidden_states[:n]
         if aux_hidden_states is not None:
@@ -217,21 +205,13 @@ class PrefillGraphRunner:
         if not self.enabled or ctx.forward_mode is None:
             return False
         # Accept pure-extend AND mixed (extend+decode) batches, as long as there is
-        # a prefill portion. Mixed batches work because the attention runs as a
-        # single eager break that dispatches the prefill/decode split per-replay
-        # (see the coarse break + live split below); the captured token-shaped
-        # compute is uniform over all rows. Pure-decode (num_extends == 0) is served
-        # by the decode graph, not here.
+        # a prefill portion. Mixed works because the attention break reads the LIVE
+        # forward context (ambient) and dispatches the prefill/decode split itself,
+        # while the captured token-shaped compute is uniform over all rows. Pure-
+        # decode (num_extends == 0) is served by the decode graph, not here.
         if ctx.num_extends <= 0:
             return False
-        is_mixed = ctx.forward_mode.is_mixed()
-        if not (ctx.forward_mode.is_extend() or is_mixed):
-            return False
-        # Mixed batches are only correct under the graph for models whose attention
-        # break recovers the LIVE prefill/decode split from the singleton backend
-        # (MLA). Other families read the split/mode from the captured (stale) ctx,
-        # so route their mixed batches to eager.
-        if is_mixed and not self.supports_mixed:
+        if not (ctx.forward_mode.is_extend() or ctx.forward_mode.is_mixed()):
             return False
         # No prefix caching in the captured path (v1): a non-zero prefix changes the
         # ragged attention layout. Checked on the pinned CPU mirror (no D2H sync).

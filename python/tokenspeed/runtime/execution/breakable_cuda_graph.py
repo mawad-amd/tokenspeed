@@ -29,18 +29,56 @@ Address-stability contract (the load-bearing invariant):
 
 from __future__ import annotations
 
+import functools
+import inspect
 import threading
-from typing import Any, Callable
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 import torch
 
 __all__ = [
     "BreakableCapture",
+    "active_forward",
     "break_attn",
     "break_here",
+    "break_point",
+    "current_forward_ctx",
     "is_breakable_capture_active",
     "weak_ref_tensor",
 ]
+
+
+# Ambient per-forward context (the model's ``ForwardContext``), mirroring
+# vLLM/SGLang's ``set_forward_context``/``get_forward_context``. An eager break
+# runs once at capture and again on every replay; the args it closed over at
+# capture are the *dummy* batch's, hence stale. Rather than thread the live
+# context through ``replay()`` (which would conflate graph mechanics with forward
+# semantics), the runner publishes it here for the duration of capture / each
+# replay, and breaks rebind their captured context to it by identity (see
+# :func:`break_here`). Breaks therefore read live ``ctx`` fields exactly like the
+# eager path -- no per-model singleton reach-around, no frozen-scalar workarounds.
+_ambient = threading.local()
+
+
+@contextmanager
+def active_forward(ctx: Any) -> Iterator[None]:
+    """Publish ``ctx`` as the ambient forward context for the enclosed block.
+
+    The runner wraps both capture and each replay in this so breaks see the live
+    context. Re-entrant (saves/restores the previous value).
+    """
+    prev = getattr(_ambient, "ctx", None)
+    _ambient.ctx = ctx
+    try:
+        yield
+    finally:
+        _ambient.ctx = prev
+
+
+def current_forward_ctx() -> Any:
+    """The ambient forward context, or ``None`` outside an :func:`active_forward`."""
+    return getattr(_ambient, "ctx", None)
 
 
 def weak_ref_tensor(t: Any) -> Any:
@@ -158,6 +196,11 @@ class BreakableCapture:
     # -- replay ------------------------------------------------------------
 
     def replay(self) -> None:
+        """Replay all segments in order.
+
+        Breaks read the live forward context from the ambient :func:`active_forward`
+        scope (the runner wraps replay in it), so this stays a pure graph primitive.
+        """
         for run in self.segments:
             run()
 
@@ -188,11 +231,15 @@ def break_here(
     Outside an active capture (eager forward, or breakable disabled) this is a
     transparent pass-through: ``fn`` runs and its result is copied into ``dst``.
 
-    Args/kwargs are bound once at capture time. Tensor args must alias persistent
-    storage (so they carry live values at replay); **non-tensor scalars are frozen
-    to their capture-time value**, so ``fn`` must derive per-request quantities
-    (batch size, seq lengths, ...) from its own live metadata, not from a passed
-    scalar. The attention backends honor this (they read ``forward_*_metadata``).
+    Args/kwargs are bound once at capture time, with two live exceptions: (1) tensor
+    args alias persistent storage (the static input buffers / pool-pinned segment
+    intermediates), so they carry live values at replay; (2) the per-forward
+    :class:`ForwardContext` is rebound by identity to the live context each replay
+    (see :meth:`BreakableCapture.replay`), so ``fn`` may read live ``ctx`` fields
+    (``forward_mode``, ``bs``, ``num_extends``, ``global_num_tokens``, ...) exactly
+    like the eager path. **Other (loose) non-tensor scalars are still frozen** to
+    their capture-time value, so route any remaining per-request quantity through
+    ``ctx`` / ``forward_*_metadata`` rather than a bare scalar arg.
 
     Args:
         fn: The break-point op (e.g. attention). Returns a tensor.
@@ -211,9 +258,23 @@ def break_here(
     weak_args = tuple(weak_ref_tensor(a) for a in args)
     weak_kwargs = {k: weak_ref_tensor(v) for k, v in kwargs.items()}
     weak_dst = weak_ref_tensor(dst)
+    # The ambient forward context at capture (the dummy batch's). At replay it is
+    # rebound by identity to the live context, so the break reads live ctx fields.
+    captured_ctx = current_forward_ctx()
 
     def replay_fn() -> torch.Tensor:
-        _land_in(weak_dst, fn(*weak_args, **weak_kwargs))
+        live_ctx = current_forward_ctx()
+
+        def sub(a: Any) -> Any:
+            return live_ctx if a is captured_ctx else a
+
+        _land_in(
+            weak_dst,
+            fn(
+                *(sub(a) for a in weak_args),
+                **{k: sub(v) for k, v in weak_kwargs.items()},
+            ),
+        )
         return weak_dst
 
     return cap.add_eager(replay_fn)
@@ -256,6 +317,48 @@ def break_attn(
         return fn(*args, **kwargs)
     dst = torch.empty(out_shape, dtype=out_dtype, device=out_device)
     return break_here(fn, dst, *args, **kwargs)
+
+
+def break_point(out: "str | Callable[..., torch.Tensor]") -> Callable:
+    """Decorator form of :func:`break_attn` for a whole method.
+
+    Decorate a sequence-mixing method (attention / MLA / linear-mixer / sparse
+    indexer ``forward``) and it runs as an eager break under a breakable capture --
+    the surrounding token-shaped compute (norms, MoE, projections) stays graphed --
+    or as a direct call otherwise. This replaces the hand-written
+    ``forward``-wrapper + ``_forward_breakable_impl`` split and the explicit
+    ``break_attn(self._impl, hidden_states.shape, dtype, device, *args)`` boilerplate.
+
+    The output handoff buffer is allocated from a reference tensor identified by
+    ``out``: either the NAME of one of the method's parameters whose
+    shape/dtype/device match the output (e.g. ``"hidden_states"`` for a coarse
+    whole-attention break that returns ``[tokens, hidden]``), or a callable
+    ``out(*args, **kwargs) -> Tensor`` for outputs that don't match any single arg.
+    Empty inputs (0 rows in the reference tensor) short-circuit to that tensor.
+
+    Inside the method ``ctx`` is live (see :func:`break_here`), so write the body
+    exactly like the eager path -- no stale-capture handling.
+    """
+
+    def decorator(method: Callable) -> Callable:
+        if callable(out):
+            getter = out
+        else:
+            idx = list(inspect.signature(method).parameters).index(out)
+
+            def getter(*args: Any, **kwargs: Any) -> torch.Tensor:
+                return kwargs[out] if out in kwargs else args[idx]
+
+        @functools.wraps(method)
+        def wrapper(*args: Any, **kwargs: Any) -> torch.Tensor:
+            ref = getter(*args, **kwargs)
+            if ref.shape[0] == 0:
+                return ref
+            return break_attn(method, ref.shape, ref.dtype, ref.device, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def _land_in(dst: torch.Tensor, result: torch.Tensor) -> None:

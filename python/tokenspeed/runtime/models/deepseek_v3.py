@@ -65,7 +65,7 @@ _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.execution.breakable_cuda_graph import break_attn
+from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -628,6 +628,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.w_kc = None
         self.w_vc = None
 
+    @break_point(out="hidden_states")
     def forward(
         self,
         positions: torch.Tensor,
@@ -639,35 +640,11 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> torch.Tensor:
         # MLA attention is a single coarse breakable-graph break: it writes/reads the
         # KV cache and runs the varlen MLA (prefill) + absorb (decode) kernels, all
-        # data/length dependent. Crucially the prefill/decode split runs EAGER inside
-        # the break (per replay) -- so one graph captured on a pure-extend dummy also
-        # serves MIXED (prefill+decode) batches. Under capture the whole attention
-        # runs eager (output token-shaped [tokens, hidden] = hidden_states.shape)
-        # while the layer norms + MoE stay graphed; direct call otherwise.
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        return break_attn(
-            self._forward_breakable_impl,
-            hidden_states.shape,
-            hidden_states.dtype,
-            hidden_states.device,
-            positions,
-            hidden_states,
-            ctx,
-            out_cache_loc,
-            comm_manager,
-            block_scale,
-        )
-
-    def _forward_breakable_impl(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-        comm_manager: CommManager,
-        block_scale: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        # data/length dependent. The prefill/decode split runs EAGER inside the break
+        # (per replay), reading the live ``ctx`` -- so one graph captured on a pure-
+        # extend dummy also serves MIXED (prefill+decode) batches. Under capture the
+        # whole attention runs eager while the layer norms + MoE stay graphed; direct
+        # call otherwise (see ``break_point``).
         if self.q_lora_rank is not None:
             qkv = self.fused_qkv_a_proj_with_mqa(
                 hidden_states, block_scale, torch.bfloat16
@@ -691,20 +668,21 @@ class DeepseekV3AttentionMLA(nn.Module):
             kv_a = latent_cache[..., : self.kv_lora_rank]
             self.kv_a_layernorm(kv_a, inplace=True)
 
-        # Recover the prefill/decode token split. Under a prefill-graph replay this
-        # break closes over a stale dummy ``ctx`` (bs/num_extends are wrong), so the
-        # runner publishes the LIVE split on the singleton attn_backend; outside the
-        # graph it is None and we derive it from ctx as usual. ``q`` may be padded to
-        # the graph bucket, so the prefill/decode slices use these real counts and the
+        # Recover the prefill/decode token split from LIVE state -- correct both in
+        # eager and under a prefill-graph replay (where ``ctx`` is the live ambient
+        # context but ``q`` is padded to the graph bucket, so q.size(0) is NOT the
+        # real token count). Decode token count comes from the live ctx; the real
+        # prefill token count from the live attention metadata (the same source the
+        # padding scrub uses). The prefill/decode slices use these real counts; the
         # padded tail rows are discarded by the caller's output slice.
         spec = ctx.attn_backend.spec_num_tokens or 1
-        split = getattr(ctx.attn_backend, "prefill_graph_token_split", None)
-        if split is not None:
-            num_prefill_tokens, num_decode_tokens = split
+        num_decodes = max(ctx.bs - ctx.num_extends, 0)
+        num_decode_tokens = num_decodes * spec
+        if ctx.num_extends > 0:
+            cmeta = ctx.attn_backend.chunked_prefill_metadata
+            num_prefill_tokens = int(sum(cmeta.extend_seq_lens_cpu))
         else:
-            num_decode_tokens = (ctx.bs - ctx.num_extends) * spec
-            num_prefill_tokens = q.size(0) - num_decode_tokens
-        num_decodes = num_decode_tokens // spec
+            num_prefill_tokens = 0
         real_total = num_prefill_tokens + num_decode_tokens
         attn_output = torch.empty(
             q.size(0),
@@ -1410,11 +1388,6 @@ class DeepseekV3Model(nn.Module):
 
 class DeepseekV3ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV3Model
-
-    # MLA attention runs as a coarse whole-attention break that recovers the LIVE
-    # prefill/decode split from ``attn_backend.prefill_graph_token_split`` each
-    # replay, so mixed (prefill+decode) batches are correct under the prefill graph.
-    prefill_graph_supports_mixed = True
 
     def __init__(
         self,

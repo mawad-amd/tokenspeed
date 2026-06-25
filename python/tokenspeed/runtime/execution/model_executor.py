@@ -504,14 +504,6 @@ class ModelExecutor:
         inner_model = getattr(causal_lm, "model", None)
         if inner_model is None or config.enforce_eager or config.disable_prefill_graph:
             return
-        # Per-model capability gates (see BaseCausalLM): some families are not yet
-        # correct under the breakable prefill graph (e.g. GLM DSA reads a stale
-        # split from the captured ctx) -- they opt out entirely. ``supports_mixed``
-        # restricts mixed (prefill+decode) batches to families whose attention
-        # break recovers the live split from the singleton backend (MLA only).
-        if not getattr(causal_lm, "prefill_graph_enabled", True):
-            return
-        supports_mixed = bool(getattr(causal_lm, "prefill_graph_supports_mixed", False))
         runner = PrefillGraphRunner(
             inner_model,
             self.input_buffers,
@@ -519,7 +511,6 @@ class ModelExecutor:
             model_is_mrope=config.model_is_mrope,
             pool=_cuda_graph_wrapper.global_graph_memory_pool,
             enabled=not config.enforce_eager,
-            supports_mixed=supports_mixed,
         )
         if not runner.enabled:
             return
