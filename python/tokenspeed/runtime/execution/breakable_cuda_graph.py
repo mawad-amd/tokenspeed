@@ -40,7 +40,6 @@ import torch
 __all__ = [
     "BreakableCapture",
     "active_forward",
-    "break_attn",
     "break_here",
     "break_point",
     "current_forward_ctx",
@@ -280,61 +279,29 @@ def break_here(
     return cap.add_eager(replay_fn)
 
 
-def break_attn(
-    fn: Callable[..., torch.Tensor],
-    out_shape: tuple[int, ...],
-    out_dtype: torch.dtype,
-    out_device: Any,
-    /,
-    *args: Any,
-    **kwargs: Any,
-) -> torch.Tensor:
-    """Run a sequence-mixing op as an eager break (or directly, when not capturing).
-
-    This is the one call every model uses to mark a break point. A *break point* is
-    any data/length-dependent sequence-mixing op that cannot be frozen into a static
-    graph -- attention, MLA, linear/mamba mixing, a sparse-attention indexer. Wrap
-    each such op's call in ``break_attn`` and the surrounding token-shaped compute
-    (norms, MLP/MoE, projections, collectives) is captured around it automatically;
-    everything not wrapped stays in the graph.
-
-    When not capturing (eager forward / breakable disabled) this is a zero-overhead
-    pass-through -- ``fn`` runs directly with no extra allocation or copy. When
-    capturing, a pool-pinned ``out_shape`` buffer is allocated in the current
-    segment and ``fn``'s result is landed into it for the next segment to read.
-
-    Args:
-        fn: The sequence-mixing op. Returns a tensor (or writes ``out=`` in place).
-        out_shape/out_dtype/out_device: shape/dtype/device of ``fn``'s output, used
-            to allocate the pool-pinned handoff buffer.
-        *args, **kwargs: forwarded to ``fn`` (see :func:`break_here` on the
-            capture-time freezing of non-tensor scalars).
-
-    Returns:
-        ``fn``'s output (the handoff buffer when capturing).
-    """
-    if not is_breakable_capture_active():
-        return fn(*args, **kwargs)
-    dst = torch.empty(out_shape, dtype=out_dtype, device=out_device)
-    return break_here(fn, dst, *args, **kwargs)
-
-
-def break_point(out: "str | Callable[..., torch.Tensor]") -> Callable:
-    """Decorator form of :func:`break_attn` for a whole method.
+def break_point(out: "str | Callable[..., Any]") -> Callable:
+    """Mark a sequence-mixing method as an eager breakable-graph break point.
 
     Decorate a sequence-mixing method (attention / MLA / linear-mixer / sparse
     indexer ``forward``) and it runs as an eager break under a breakable capture --
-    the surrounding token-shaped compute (norms, MoE, projections) stays graphed --
-    or as a direct call otherwise. This replaces the hand-written
-    ``forward``-wrapper + ``_forward_breakable_impl`` split and the explicit
-    ``break_attn(self._impl, hidden_states.shape, dtype, device, *args)`` boilerplate.
+    the surrounding token-shaped compute (norms, MoE, projections, collectives) is
+    captured around it automatically, while everything inside the method stays
+    eager -- or a zero-overhead direct call when not capturing. This is the one
+    decorator every model uses to mark a break; it wraps the lower-level
+    :func:`break_here` primitive (allocates the pool-pinned handoff buffer and
+    lands the eager result into it for the next captured segment to read).
 
-    The output handoff buffer is allocated from a reference tensor identified by
-    ``out``: either the NAME of one of the method's parameters whose
-    shape/dtype/device match the output (e.g. ``"hidden_states"`` for a coarse
-    whole-attention break that returns ``[tokens, hidden]``), or a callable
-    ``out(*args, **kwargs) -> Tensor`` for outputs that don't match any single arg.
-    Empty inputs (0 rows in the reference tensor) short-circuit to that tensor.
+    The output handoff buffer's shape/dtype/device are resolved from ``out``, which
+    is one of:
+
+    * the NAME of a method parameter whose shape/dtype/device match the output
+      (e.g. ``"hidden_states"`` for a coarse whole-attention break returning
+      ``[tokens, hidden]``); empty inputs (0 rows) short-circuit to that tensor.
+    * a callable ``out(*args, **kwargs)`` returning either a reference TENSOR (use
+      its shape/dtype/device; 0 rows short-circuits) or an explicit
+      ``(shape, dtype, device)`` tuple -- for a NARROW break whose output shape
+      matches no single input (e.g. MLA attention, where the output is
+      ``[tokens, heads*v_head_dim]`` but ``q`` is ``[tokens, heads*qk_head_dim]``).
 
     Inside the method ``ctx`` is live (see :func:`break_here`), so write the body
     exactly like the eager path -- no stale-capture handling.
@@ -352,9 +319,16 @@ def break_point(out: "str | Callable[..., torch.Tensor]") -> Callable:
         @functools.wraps(method)
         def wrapper(*args: Any, **kwargs: Any) -> torch.Tensor:
             ref = getter(*args, **kwargs)
-            if ref.shape[0] == 0:
-                return ref
-            return break_attn(method, ref.shape, ref.dtype, ref.device, *args, **kwargs)
+            if isinstance(ref, torch.Tensor):
+                if ref.shape[0] == 0:
+                    return ref
+                shape, dtype, device = ref.shape, ref.dtype, ref.device
+            else:
+                shape, dtype, device = ref
+            if not is_breakable_capture_active():
+                return method(*args, **kwargs)
+            dst = torch.empty(shape, dtype=dtype, device=device)
+            return break_here(method, dst, *args, **kwargs)
 
         return wrapper
 

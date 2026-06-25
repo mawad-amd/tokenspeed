@@ -628,7 +628,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.w_kc = None
         self.w_vc = None
 
-    @break_point(out="hidden_states")
     def forward(
         self,
         positions: torch.Tensor,
@@ -638,13 +637,16 @@ class DeepseekV3AttentionMLA(nn.Module):
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # MLA attention is a single coarse breakable-graph break: it writes/reads the
-        # KV cache and runs the varlen MLA (prefill) + absorb (decode) kernels, all
-        # data/length dependent. The prefill/decode split runs EAGER inside the break
-        # (per replay), reading the live ``ctx`` -- so one graph captured on a pure-
-        # extend dummy also serves MIXED (prefill+decode) batches. Under capture the
-        # whole attention runs eager while the layer norms + MoE stay graphed; direct
-        # call otherwise (see ``break_point``).
+        # NARROW MLA break: the token-shaped input/output PROJECTIONS (q/kv-down,
+        # layernorm, q_b_proj, o_proj) stay in the captured prefill graph; only the
+        # data-dependent attention -- the KV write + varlen prefill / absorb decode
+        # kernels + the live prefill/decode split -- runs as the eager break
+        # (``_attention_core``). This keeps the big projection GEMMs graphed instead
+        # of dispatch-bound eager, collapsing the inter-segment bubbles that a coarse
+        # whole-attention break leaves. Outside capture the ``@break_point`` on
+        # ``_attention_core`` is a direct call, so the eager path is unchanged.
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         if self.q_lora_rank is not None:
             qkv = self.fused_qkv_a_proj_with_mqa(
                 hidden_states, block_scale, torch.bfloat16
@@ -668,13 +670,39 @@ class DeepseekV3AttentionMLA(nn.Module):
             kv_a = latent_cache[..., : self.kv_lora_rank]
             self.kv_a_layernorm(kv_a, inplace=True)
 
-        # Recover the prefill/decode token split from LIVE state -- correct both in
-        # eager and under a prefill-graph replay (where ``ctx`` is the live ambient
-        # context but ``q`` is padded to the graph bucket, so q.size(0) is NOT the
-        # real token count). Decode token count comes from the live ctx; the real
-        # prefill token count from the live attention metadata (the same source the
-        # padding scrub uses). The prefill/decode slices use these real counts; the
-        # padded tail rows are discarded by the caller's output slice.
+        attn_output = self._attention_core(
+            positions, q, latent_cache, ctx, out_cache_loc
+        )
+
+        if ctx.draft_first_step_reduce:
+            # KV already written; drop dead-position rows so o_proj / MLP /
+            # post-norms only run on one live row per request.
+            attn_output = attn_output.index_select(0, ctx.gather_ids)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    @break_point(
+        out=lambda self, positions, q, *a, **k: (
+            (q.size(0), self.num_local_heads * self.v_head_dim),
+            q.dtype,
+            q.device,
+        )
+    )
+    def _attention_core(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        # The eager break: KV write + varlen prefill / absorb decode attention, with
+        # the prefill/decode split recovered from LIVE state -- correct both in eager
+        # and under a prefill-graph replay (where ``ctx`` is the live ambient context
+        # but ``q`` is padded to the graph bucket, so q.size(0) is NOT the real token
+        # count). Decode token count comes from the live ctx; the real prefill token
+        # count from the live attention metadata (the same source the padding scrub
+        # uses). Padded tail rows produce discarded garbage.
         spec = ctx.attn_backend.spec_num_tokens or 1
         num_decodes = max(ctx.bs - ctx.num_extends, 0)
         num_decode_tokens = num_decodes * spec
@@ -725,12 +753,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 attn_output[num_prefill_tokens:real_total],
             )
 
-        if ctx.draft_first_step_reduce:
-            # KV already written; drop dead-position rows so o_proj / MLP /
-            # post-norms only run on one live row per request.
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return attn_output
 
     def forward_absorb(
         self,

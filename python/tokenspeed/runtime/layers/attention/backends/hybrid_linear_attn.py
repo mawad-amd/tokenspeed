@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
     fused_qkv_split_gdn_prefill,
 )
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
@@ -1265,6 +1266,17 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     # ---- Forward dispatch ----
 
+    @break_point(
+        # The hybrid wrapper OVERRIDES the base forward, so it needs its own
+        # @break_point (else its full-attn + GDN layers bypass the base decoration).
+        # Output shape is q-based for full-attention layers (real q/layer) and
+        # z-shaped for the linear/GDN path (called with q=None, ``z`` in kwargs).
+        out=lambda self, q=None, k=None, v=None, layer=None, *a, **kw: (
+            ((q.shape[0], layer.tp_q_head_num * layer.v_head_dim), q.dtype, q.device)
+            if q is not None
+            else (kw["z"].shape, kw["z"].dtype, kw["z"].device)
+        )
+    )
     def forward(
         self,
         q: torch.Tensor,
@@ -1331,6 +1343,15 @@ class HybridLinearAttnBackend(AttentionBackend):
                     forward_mode=forward_mode,
                     **kwargs,
                 )
+        # Canonicalize the GDN scan's data-dependent rank: gdn_chunk_prefill mirrors
+        # its input rank, returning batched [1, T, Hv, D] for the uniform bs=1 path
+        # (which the prefill-graph dummy capture batch hits) vs ragged [T, Hv, D]
+        # otherwise. Collapse the leading batch-1 dim so this method has a stable
+        # output shape ([T, Hv, D] == z.shape) -- required for the @break_point
+        # handoff buffer, and lets the model drop its own canonicalizing reshape.
+        # Full-attention output is 2D and untouched.
+        if ret is not None and ret.dim() == 4:
+            ret = ret.flatten(0, 1)
         return ret
 
     def forward_decode(

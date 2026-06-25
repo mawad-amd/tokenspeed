@@ -45,7 +45,6 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 # Distributed
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.breakable_cuda_graph import break_attn
 from tokenspeed.runtime.execution.context import ForwardContext
 
 # Layers - Attention
@@ -413,17 +412,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             "z": z,
         }
 
-        # The GDN mixer (causal conv1d + chunked gated-delta scan) is a breakable-
+        # The GDN mixer (causal conv1d + chunked gated-delta scan) is the breakable-
         # graph break point: it is data/length-dependent and mutates the recurrent
         # conv/ssm state in place (via live cache_indices), so under a prefill-graph
-        # capture it must run eager while the surrounding in/out projections, gating
-        # and norm stay graphed. No-op (direct call) when not capturing. See
-        # docs/design/prefill-breakable-cudagraph.md.
-        #
-        # The scan kernel returns either a batched [1, T, Hv, D] (uniform bs=1) or a
-        # ragged [T, Hv, D] tensor -- its rank is data-dependent -- so canonicalize
-        # to z.shape ([T, Hv, D], same element count) before landing it in the
-        # fixed-shape break buffer. The downstream norm flattens it the same way.
+        # capture it runs eager (the @break_point on the linear attn backend's
+        # forward) while the surrounding in/out projections, gating and norm stay
+        # graphed. Direct call when not capturing. The backend returns a rank-stable
+        # [T, Hv, D] (== z.shape) -- it canonicalizes the scan's batched-vs-ragged
+        # output internally -- so no model-side reshape is needed here.
         attn_kwargs = dict(
             q=None,
             k=None,
@@ -435,17 +431,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             bs=ctx.bs,
             **kwargs,
         )
-        # Freeze the target shape in an immutable local: ``z`` is reassigned below
-        # (``z = z.reshape(...)``), and the break's reshape closure would otherwise
-        # capture the *reassigned* z by reference and reshape to the wrong shape on
-        # replay.
-        core_shape = z.shape
-        core_attn_out = break_attn(
-            lambda: ctx.attn_backend.forward(**attn_kwargs).reshape(core_shape),
-            core_shape,
-            z.dtype,
-            z.device,
-        )
+        core_attn_out = ctx.attn_backend.forward(**attn_kwargs)
 
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
